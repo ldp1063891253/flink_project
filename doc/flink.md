@@ -576,3 +576,708 @@ public enum RuntimeExecutionMode {
 1. 在13版本之前不要使用`执行模式`，若数据只有一个(如： (txt,1)），那么该数据不会被输出，13版本修复了该问题。
 2. 批处理不会存状态（处理完就直接输出了，所以没有必要保留状态）
 
+
+
+# 四： Windows窗口函数
+
+https://juejin.cn/post/7048154412442714119#heading-3
+
+
+
+> Windows是处理无限数据流的核心，它将流分割成有限大小的桶（buckets），并在其上执行各种计算。
+
+窗口化的Flink程序的结构通常如下，有分组流（keyed streams）和无分组流（non-keyed streams）两种。两者的不同之处在于，分组流中调用了`keyBy(...)`方法，无分组流中使用`windowAll(...)`替代分组流中的`window(...)`方法。
+
+![image.png](img/6fdcfa458ebb4dacb75830f16c0912e5~tplv-k3u1fbpfcp-watermark.awebp)
+
+## Window生命周期
+
+​      当属于一个窗口的第一个元素到达时，这个窗口被创建，当时间（event or processing time）经过了它的结束时间戳与用户指定允许延时之后，窗口将被完全移除。同时，Flink确保只对基于时间的窗口执行删除操作，而对于其他类型不做此处理（例：global windows）。举个例子，基于事件时间的窗口策略每5分钟创建一个不重叠窗口，允许1分钟的延时，那么，当时间戳属于12:00-12:05这个区间的第一个元素到达时，Flink将为其创建一个新的窗口，一直到watermark到达12:06这个时间戳时，Flink删除该窗口。
+
+​      Flink中，每个窗口都有一个触发器（Trigger）和函数（ProcessWindowFunction, ReduceFunction, AggregateFunction or FoldFunction）与之关联。其中，函数中包含了作用于窗口中的元素的计算逻辑，触发器用于说明什么条件下执行窗口的函数计算。触发策略通常类似于“当窗口中的元素个数超过4个时”，或者“当watermark到达窗口结束时间戳时”。触发器还可以决定在窗口生命周期内的任何时间清除窗口中的内容。这种情况下的清除操作只会涉及到窗口中的元素，而不会清除窗口的元数据（window metadata）。也就是说，新的元素任然可以被添加到这个窗口中。
+
+除此之外，你还可以指定一个回收器（Evictor），它能够在触发器被触发后以及函数作用之前或之后从窗口中删除元素。
+
+### 分组窗口和无分组窗口
+
+在定义窗口之前，首先需要明确的是我们的数据流是否需要分组。使用`keyBy(...)`会将无线流分隔成逻辑上分组的流，反之，则不会分组流数据。
+
+在分组流中，传入事件的任何属性都可以作为分组流的键。由于每个分组流都可以独立于其他流被处理，所以分组流中允许多个任务并行地进行窗口计算。所有引用了同一个键的元素将会被发送到相同的并行任务。
+
+对于无分组的数据流，数据源不会被分隔成多个逻辑流，所有的窗口计算逻辑将会在**一个任务**中执行。（多个分区的情况下，也在一个分区）
+
+## 窗口分配器（Window Assigners）
+
+确定了窗口是否分组之后，接下来我们需要定义分配器，窗口分配器定义如何将元素分配给窗口。
+
+WindowAssigner负责将传入的元素分配给一个或多个窗口。Flink基于一些常见的应用场景，为我们提供了几个预定义的WindowAssigner，分别是滚动窗口（tumbling windows）、滑动窗口（sliding windows）、会话窗口（session windows）以及全局窗口（global windows）。我们也可以通过继承WindowAssigner类来自定义窗口分配器逻辑。Flink内置的WindowAssigner中，除了global windows，其余几个都是基于时间（processing time or event time）来为窗口分配元素。
+
+基于时间的窗口包含一个start timestamp（大于等于）和一个end timestamp（小于），两者的时间差用于表示窗口大小。同时，我们可以通过Flink提供的TimeWindow来查询开始、结束时间戳，还可以通过`maxTimestamp()`方法获取给定窗口允许的最大时间戳。
+
+```text
+可以分为基于时间的窗口和元素个数的窗口
+基于时间的：滚动窗口（tumbling windows）、滑动窗口（sliding windows）、会话窗口（session windows）以及全局窗口（global windows）
+基于元素个数的：滚动窗口与滑动窗口
+```
+
+
+
+#### Tumbling Windows
+
+滚动窗口分配器会将每个元素分配给一个指定窗口大小的窗口。滚动窗口具有固定的窗口大小，并且窗口之间不会重叠。比如下图展示的是一个设定为5分钟窗口大小的滚动窗口，每五分钟会创建一个新的窗口。
+
+![image.png](img/1212121)
+
+```java
+DataStream<T> input = ...;
+
+// tumbling event-time windows
+input
+    .keyBy(<key selector>)
+    .window(TumblingEventTimeWindows.of(Time.seconds(5)))
+    .<windowed transformation>(<window function>);
+
+// tumbling processing-time windows
+input
+    .keyBy(<key selector>)
+    .window(TumblingProcessingTimeWindows.of(Time.seconds(5)))
+    .<windowed transformation>(<window function>);
+
+// daily tumbling event-time windows offset by -8 hours.
+input
+    .keyBy(<key selector>)
+    .window(TumblingEventTimeWindows.of(Time.days(1), Time.hours(-8)))
+    .<windowed transformation>(<window function>);
+
+```
+
+如上段代码中最后一个例子展示的那样，tumbling window assigners包含一个可选的`offset`参数，我们可以用它来改变窗口的对齐方式。比如，一个没有偏移量的按小时滚动窗口，它创建的时间窗口通常是`1:00:00.000 - 1:59:59.999`,`2:00:00.000 - 2:59:59.999`，当我们给定一个15分钟的偏移量时，时间窗口将会变成`1:15:00.000 - 2:14:59.999`,`2:15:00.000 - 3:14:59.999`。在实际应用中，一个比较常见的使用场景是通过`offset`将窗口调整到UTC-0以外的时区，比如通过`Time.hours(-8)`调整时区到东八区。
+
+window.getStart()) 可以获取到窗口时间：
+
+```java
+        //开窗
+        WindowedStream<Tuple2<String, Integer>, Tuple, TimeWindow> windowedStream =
+                tuple2TupleKeyedStream.window(TumblingProcessingTimeWindows.of(Time.seconds(5)));
+
+
+        //全量窗口
+  SingleOutputStreamOperator<Tuple2<String, Integer>> result = windowedStream.apply(new WindowFunction<Tuple2<String, Integer>, Tuple2<String, Integer>, Tuple, TimeWindow>() {
+            @Override
+            public void apply(Tuple tuple, TimeWindow window, Iterable<Tuple2<String, Integer>> input, Collector<Tuple2<String, Integer>> out) throws Exception {
+
+                  //迭代器的长度  window.getStart())窗口时间
+                ArrayList<Tuple2<String, Integer>> tuple2ArrayList = Lists.newArrayList(input.iterator());
+                out.collect(new Tuple2<>(new Timestamp(window.getStart())+":"+tuple.toString(), tuple2ArrayList.size()));
+
+            }
+        });
+```
+
+
+
+![image-20220209202736296](img/image-20220209202736296.png)
+
+
+
+```java
+package com.ldp.flink.window;
+
+
+
+
+import org.apache.commons.compress.utils.Lists;
+import org.apache.flink.api.common.functions.AggregateFunction;
+import org.apache.flink.api.common.functions.FlatMapFunction;
+import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.streaming.api.datastream.DataStreamSource;
+import org.apache.flink.streaming.api.datastream.KeyedStream;
+import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
+import org.apache.flink.streaming.api.datastream.WindowedStream;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.windowing.ProcessWindowFunction;
+import org.apache.flink.streaming.api.functions.windowing.WindowFunction;
+import org.apache.flink.streaming.api.windowing.assigners.TumblingProcessingTimeWindows;
+import org.apache.flink.streaming.api.windowing.time.Time;
+import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
+import org.apache.flink.util.Collector;
+
+import java.sql.Timestamp;
+import java.util.ArrayList;
+import java.util.Arrays;
+
+/**
+ * Tumbling Windows
+ */
+public class TimeTumbling {
+    public static void main(String[] args) throws Exception {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+        env.setParallelism(1);
+
+        DataStreamSource<String> dataStreamSource = env.socketTextStream("node01", 9999);
+
+
+        SingleOutputStreamOperator<Tuple2<String, Integer>> streamOperator = dataStreamSource.flatMap(new FlatMapFunction<String, Tuple2<String, Integer>>() {
+
+
+            @Override
+            public void flatMap(String value, Collector<Tuple2<String, Integer>> out) throws Exception {
+                String[] split = value.split(" ");
+                for (int i = 0; i < split.length; i++) {
+                    out.collect(new Tuple2<>(split[i], 1));
+                }
+            }
+        });
+
+        KeyedStream<Tuple2<String, Integer>, String> keyedStream = streamOperator.keyBy(data -> data.f0);
+
+
+        //开窗
+        WindowedStream<Tuple2<String, Integer>, String, TimeWindow> windowedStream = keyedStream.window(TumblingProcessingTimeWindows.of(Time.seconds(5)));
+
+        //增量聚合计算
+        //第一种方式
+//       SingleOutputStreamOperator<Tuple2<String, Integer>> result = windowedStream.sum(1);
+
+        //第二种方式 使用aggregate方法
+//        SingleOutputStreamOperator<Tuple2<String, Integer>> result = windowedStream.aggregate(new MyAggFun(), new MyWindowFun());
+
+        //第三种方式 使用process方法
+        SingleOutputStreamOperator<Tuple2<String, Integer>> result = windowedStream.process(new ProcessWindowFunction<Tuple2<String, Integer>, Tuple2<String, Integer>, String, TimeWindow>() {
+            @Override
+            public void process(String key, Context context, Iterable<Tuple2<String, Integer>> elements, Collector<Tuple2<String, Integer>> out) throws Exception {
+                //迭代器的长度  window.getStart())窗口时间
+                ArrayList<Tuple2<String, Integer>> tuple2ArrayList = Lists.newArrayList(elements.iterator());
+                out.collect(new Tuple2<>(new Timestamp(context.window().getStart()) + ":" + key, tuple2ArrayList.size()));
+            }
+        });
+
+
+        //全量窗口 apply方法
+/*        SingleOutputStreamOperator<Tuple2<String, Integer>> result = windowedStream.apply(new WindowFunction<Tuple2<String, Integer>, Tuple2<String, Integer>, Tuple, TimeWindow>() {
+            @Override
+            public void apply(Tuple tuple, TimeWindow window, Iterable<Tuple2<String, Integer>> input, Collector<Tuple2<String, Integer>> out) throws Exception {
+
+                  //迭代器的长度  window.getStart())窗口时间
+                ArrayList<Tuple2<String, Integer>> tuple2ArrayList = Lists.newArrayList(input.iterator());
+                out.collect(new Tuple2<>(new Timestamp(window.getStart())+":"+tuple.toString(), tuple2ArrayList.size()));
+
+            }
+        });*/
+        result.print();
+
+
+
+        env.execute();
+
+    }
+
+    private static class MyAggFun implements AggregateFunction<Tuple2<String, Integer>, Integer, Integer> {
+        @Override
+        public Integer createAccumulator() {
+            return 0;
+        }
+
+        @Override
+        public Integer add(Tuple2<String, Integer> value, Integer accumulator) {
+            return 1+accumulator;
+        }
+
+        @Override
+        public Integer getResult(Integer accumulator) {
+            return accumulator;
+        }
+
+        @Override
+        public Integer merge(Integer a, Integer b) {
+            return a + b;
+        }
+    }
+
+    private static class MyWindowFun implements WindowFunction<Integer,Tuple2<String, Integer>,String,TimeWindow>{
+
+        @Override
+        public void apply(String key, TimeWindow window, Iterable<Integer> input, Collector<Tuple2<String, Integer>> out) throws Exception {
+                    //取出迭代器中的数据
+            Integer integer = input.iterator().next();
+            out.collect(new Tuple2<>(new Timestamp(window.getStart())+":"+key, integer));
+        }
+    }
+}
+
+```
+
+
+
+#### Sliding Windows
+
+滑动窗口分配器同样是将元素分配给固定大小的时间窗口，窗口大小的配置方式与滚动窗口一样，不同之处在于，滑动窗口还有一个额外的`slide`参数用于控制窗口滑动的频率。当`slide`小于`window size`时，滑动窗口便会重叠。这种情况下同一个元素将会被分配给多个窗口。
+
+比如下图这样，设置了一个10分钟大小的滑动窗口，它的滑动参数(`slide`)为5分钟。这样的话，每5分钟将会创建一个新的窗口，并且这个窗口中包含了一部分来自上一个窗口的元素。
+
+![image.png](https://p3-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/9191c2a50f9543d88520945d2d6d9893~tplv-k3u1fbpfcp-watermark.awebp?)
+
+```java
+DataStream<T> input = ...;
+
+// sliding event-time windows
+input
+    .keyBy(<key selector>)
+    .window(SlidingEventTimeWindows.of(Time.seconds(10), Time.seconds(5)))
+    .<windowed transformation>(<window function>);
+
+// sliding processing-time windows
+input
+    .keyBy(<key selector>)
+    .window(SlidingProcessingTimeWindows.of(Time.seconds(10), Time.seconds(5)))
+    .<windowed transformation>(<window function>);
+
+// sliding processing-time windows offset by -8 hours
+input
+    .keyBy(<key selector>)
+    .window(SlidingProcessingTimeWindows.of(Time.hours(12), Time.hours(1), Time.hours(-8)))
+    .<windowed transformation>(<window function>);
+复制代码
+```
+
+同样，我们可以通过`offset`参数来为窗口设置偏移量。
+
+#### Session Windows
+
+会话窗口通过活动会话来对元素进行分组。不同于滚动窗口和滑动窗口，会话窗口不会重叠，也没有固定的开始、结束时间。当一个会话窗口在指定的时间区间内没有接收到新的数据时，这个窗口将会被关闭。会话窗口分配器可以直接配置一个静态常量会话间隔，也可以通过函数来动态指定会话间隔时间。
+
+![image.png](https://p9-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/64188a898d6a4e98ad5209021eed976d~tplv-k3u1fbpfcp-watermark.awebp?)
+
+```java
+DataStream<T> input = ...;
+
+// event-time session windows with static gap
+input
+    .keyBy(<key selector>)
+    .window(EventTimeSessionWindows.withGap(Time.minutes(10)))
+    .<windowed transformation>(<window function>);
+    
+// event-time session windows with dynamic gap
+input
+    .keyBy(<key selector>)
+    .window(EventTimeSessionWindows.withDynamicGap((element) -> {
+        // determine and return session gap
+    }))
+    .<windowed transformation>(<window function>);
+
+// processing-time session windows with static gap
+input
+    .keyBy(<key selector>)
+    .window(ProcessingTimeSessionWindows.withGap(Time.minutes(10)))
+    .<windowed transformation>(<window function>);
+    
+// processing-time session windows with dynamic gap
+input
+    .keyBy(<key selector>)
+    .window(ProcessingTimeSessionWindows.withDynamicGap((element) -> {
+        // determine and return session gap
+    }))
+    .<windowed transformation>(<window function>);
+复制代码
+```
+
+如上，固定大小的会话间隔可以通过`Time.milliseconds(x)`,`Time.seconds(x)`,`Time.minutes(x)`来指定，动态会话间隔通过实现`SessionWindowTimeGapExtractor`接口来指定。 **注意：**由于会话窗口没有固定的开始结束时间，它的计算方法与滚动窗口、滑动窗口有所不同。在一个会话窗口算子内部会为每一个接收到的元素创建一个新的窗口，如果这些元素之间的时间间隔小于定义的会话窗口间隔，则将阿门合并到一个窗口。为了能够进行窗口合并，我们需要为会话窗口定义一个`Tigger`函数和`Window Function`函数（例如ReduceFunction, AggregateFunction, or ProcessWindowFunction. FoldFunction不能用于合并）。
+
+#### Global Windows
+
+全局窗口分配器会将具有相同key值的所有元素分配在同一个窗口。这种窗口模式下需要我们设置一个自定义的`Trigger`，否则将不会执行任何计算，这是因为全局窗口中没有一个可以处理聚合元素的自然末端。
+
+![image.png](https://p6-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/09a58231cb9741d199e46b624a576ccc~tplv-k3u1fbpfcp-watermark.awebp?)
+
+```java
+DataStream<T> input = ...;
+
+input
+    .keyBy(<key selector>)
+    .window(GlobalWindows.create())
+    .<windowed transformation>(<window function>);
+```
+
+## Window Function
+
+定义好窗口分配器之后，我们需要指定作用于每个窗口上的计算。这可以通过指定Window Function来实现，一旦系统确定了某个窗口已经准备好进行处理，该函数将会处理窗口中的每个元素。
+
+Window Function通常有这几种：ReduceFunction，AggregateFunction，FoldFunction以及ProcessWindowFunction。其中，前两个函数可以高效执行，因为Flink可以在每个元素到达窗口时增量的聚合这些元素。ProcessWindowFunction持有一个窗口中包含的所有元素的Iterable对象，以及元素所属窗口的附加meta信息。
+
+`ProcessWindowFunction`无法高效执行是因为在调用函数之前Flink必须在内部缓存窗口中的所有元素。我们可以将`ProcessWindowFunction`和`ReduceFunction`,`AggregateFunction`, 或者`FoldFunction`函数结合来缓解这个问题，从而可以获取窗口元素的聚合数据以及ProcessWindowFunction接收的窗口meta数据。
+
+#### ReduceFunction
+
+ReduceFunction用于指明如何组合输入流中的两个元素来生成一个相同类型的输出元素。Flink使用ReduceFunction增量地聚合窗口中的元素。
+
+```java
+DataStream<Tuple2<String, Long>> input = ...;
+
+input
+    .keyBy(<key selector>)
+    .window(<window assigner>)
+    .reduce(new ReduceFunction<Tuple2<String, Long>> {
+      public Tuple2<String, Long> reduce(Tuple2<String, Long> v1, Tuple2<String, Long> v2) {
+        return new Tuple2<>(v1.f0, v1.f1 + v2.f1);
+      }
+    });
+```
+
+#### AggregateFunction
+
+AggregateFunction可以称之为广义上的ReduceFunction，它包含三种元素类型：输入类型（IN），累加器类型（ACC）以及输出类型（OUT）。AggregateFunction接口中有一个用于创建初始累加器、合并两个累加器的值到一个累加器以及从累加器中提取输出结果的方法。
+
+```java
+/**
+ * The accumulator is used to keep a running sum and a count. The {@code getResult} method
+ * computes the average.
+ */
+private static class AverageAggregate
+    implements AggregateFunction<Tuple2<String, Long>, Tuple2<Long, Long>, Double> {
+  @Override
+  public Tuple2<Long, Long> createAccumulator() {
+    return new Tuple2<>(0L, 0L);
+  }
+
+  @Override
+  public Tuple2<Long, Long> add(Tuple2<String, Long> value, Tuple2<Long, Long> accumulator) {
+    return new Tuple2<>(accumulator.f0 + value.f1, accumulator.f1 + 1L);
+  }
+
+  @Override
+  public Double getResult(Tuple2<Long, Long> accumulator) {
+    return ((double) accumulator.f0) / accumulator.f1;
+  }
+
+  @Override
+  public Tuple2<Long, Long> merge(Tuple2<Long, Long> a, Tuple2<Long, Long> b) {
+    return new Tuple2<>(a.f0 + b.f0, a.f1 + b.f1);
+  }
+}
+
+DataStream<Tuple2<String, Long>> input = ...;
+
+input
+    .keyBy(<key selector>)
+    .window(<window assigner>)
+    .aggregate(new AverageAggregate());
+复制代码
+```
+
+#### FoldFunction
+
+FoldFunction用于指定窗口中的输入元素如何与给定类型的输出元素相结合。对于输入到窗口中的每个元素，递增调用FoldFunction将其与当前输出值合并。
+
+```java
+DataStream<Tuple2<String, Long>> input = ...;
+
+input
+    .keyBy(<key selector>)
+    .window(<window assigner>)
+    .fold("", new FoldFunction<Tuple2<String, Long>, String>> {
+       public String fold(String acc, Tuple2<String, Long> value) {
+         return acc + value.f1;
+       }
+    });
+复制代码
+```
+
+**注意：fold()不能用于会话窗口或其他可合并的窗口**
+
+#### ProcessWindowFunction
+
+从ProcessWindowFunction中可以获取一个包含窗口中所有元素的迭代对象，以及一个用来访问时间和状态信息的Context对象，这使得它比其他窗口函数更加灵活。当然，这也带来了更大的性能开销和资源消耗。
+
+```java
+public abstract class ProcessWindowFunction<IN, OUT, KEY, W extends Window> implements Function {
+
+    /**
+     * Evaluates the window and outputs none or several elements.
+     *
+     * @param key The key for which this window is evaluated.
+     * @param context The context in which the window is being evaluated.
+     * @param elements The elements in the window being evaluated.
+     * @param out A collector for emitting elements.
+     *
+     * @throws Exception The function may throw exceptions to fail the program and trigger recovery.
+     */
+    public abstract void process(
+            KEY key,
+            Context context,
+            Iterable<IN> elements,
+            Collector<OUT> out) throws Exception;
+
+   	/**
+   	 * The context holding window metadata.
+   	 */
+   	public abstract class Context implements java.io.Serializable {
+   	    /**
+   	     * Returns the window that is being evaluated.
+   	     */
+   	    public abstract W window();
+
+   	    /** Returns the current processing time. */
+   	    public abstract long currentProcessingTime();
+
+   	    /** Returns the current event-time watermark. */
+   	    public abstract long currentWatermark();
+
+   	    /**
+   	     * State accessor for per-key and per-window state.
+   	     *
+   	     * <p><b>NOTE:</b>If you use per-window state you have to ensure that you clean it up
+   	     * by implementing {@link ProcessWindowFunction#clear(Context)}.
+   	     */
+   	    public abstract KeyedStateStore windowState();
+
+   	    /**
+   	     * State accessor for per-key global state.
+   	     */
+   	    public abstract KeyedStateStore globalState();
+   	}
+
+}
+复制代码
+```
+
+其中的key参数是通过`keyBy()`中指定的`KeySelector`来获取的键值。对于元组（tuple）索引的key或是字符串字段引用的key，这里的KEY参数类型都是元组类型，我们需要手动将其转换为正确大小的元组，以便于从中提取key值。
+
+```java
+DataStream<Tuple2<String, Long>> input = ...;
+
+input
+  .keyBy(t -> t.f0)
+  .timeWindow(Time.minutes(5))
+  .process(new MyProcessWindowFunction());
+
+/* ... */
+
+public class MyProcessWindowFunction 
+    extends ProcessWindowFunction<Tuple2<String, Long>, String, String, TimeWindow> {
+
+  @Override
+  public void process(String key, Context context, Iterable<Tuple2<String, Long>> input, Collector<String> out) {
+    long count = 0;
+    for (Tuple2<String, Long> in: input) {
+      count++;
+    }
+    out.collect("Window: " + context.window() + "count: " + count);
+  }
+}
+复制代码
+```
+
+#### ProcessWindowFunction with Incremental Aggregation
+
+正如前文中提到的，我们可以将ReduceFunction、AggregateFunction或者FoldFunction与ProcessWindowFunction结合起来使用，这样不但可以增量地执行窗口计算，还可以获取ProcessWindowFunction为我们提供的一些额外的窗口meta信息。
+
+##### Incremental Window Aggregation with ReduceFunction
+
+下面这个例子说明了如何将二者结合起来，以返回窗口中的最小事件和窗口的开始时间
+
+```java
+DataStream<SensorReading> input = ...;
+
+input
+  .keyBy(<key selector>)
+  .timeWindow(<duration>)
+  .reduce(new MyReduceFunction(), new MyProcessWindowFunction());
+
+// Function definitions
+
+private static class MyReduceFunction implements ReduceFunction<SensorReading> {
+
+  public SensorReading reduce(SensorReading r1, SensorReading r2) {
+      return r1.value() > r2.value() ? r2 : r1;
+  }
+}
+
+private static class MyProcessWindowFunction
+    extends ProcessWindowFunction<SensorReading, Tuple2<Long, SensorReading>, String, TimeWindow> {
+
+  public void process(String key,
+                    Context context,
+                    Iterable<SensorReading> minReadings,
+                    Collector<Tuple2<Long, SensorReading>> out) {
+      SensorReading min = minReadings.iterator().next();
+      out.collect(new Tuple2<Long, SensorReading>(context.window().getStart(), min));
+  }
+}
+复制代码
+```
+
+##### Incremental Window Aggregation with AggregateFunction
+
+示例：计算元素平均值，同时输出key值与均值。
+
+```java
+DataStream<Tuple2<String, Long>> input = ...;
+
+input
+  .keyBy(<key selector>)
+  .timeWindow(<duration>)
+  .aggregate(new AverageAggregate(), new MyProcessWindowFunction());
+
+// Function definitions
+
+/**
+ * The accumulator is used to keep a running sum and a count. The {@code getResult} method
+ * computes the average.
+ */
+private static class AverageAggregate
+    implements AggregateFunction<Tuple2<String, Long>, Tuple2<Long, Long>, Double> {
+  @Override
+  public Tuple2<Long, Long> createAccumulator() {
+    return new Tuple2<>(0L, 0L);
+  }
+
+  @Override
+  public Tuple2<Long, Long> add(Tuple2<String, Long> value, Tuple2<Long, Long> accumulator) {
+    return new Tuple2<>(accumulator.f0 + value.f1, accumulator.f1 + 1L);
+  }
+
+  @Override
+  public Double getResult(Tuple2<Long, Long> accumulator) {
+    return ((double) accumulator.f0) / accumulator.f1;
+  }
+
+  @Override
+  public Tuple2<Long, Long> merge(Tuple2<Long, Long> a, Tuple2<Long, Long> b) {
+    return new Tuple2<>(a.f0 + b.f0, a.f1 + b.f1);
+  }
+}
+
+private static class MyProcessWindowFunction
+    extends ProcessWindowFunction<Double, Tuple2<String, Double>, String, TimeWindow> {
+
+  public void process(String key,
+                    Context context,
+                    Iterable<Double> averages,
+                    Collector<Tuple2<String, Double>> out) {
+      Double average = averages.iterator().next();
+      out.collect(new Tuple2<>(key, average));
+  }
+}
+复制代码
+```
+
+##### Incremental Window Aggregation with FoldFunction
+
+示例：返回窗口中的事件数量，同时返回key值和窗口结束时间。
+
+```java
+DataStream<SensorReading> input = ...;
+
+input
+  .keyBy(<key selector>)
+  .timeWindow(<duration>)
+  .fold(new Tuple3<String, Long, Integer>("",0L, 0), new MyFoldFunction(), new MyProcessWindowFunction())
+
+// Function definitions
+
+private static class MyFoldFunction
+    implements FoldFunction<SensorReading, Tuple3<String, Long, Integer> > {
+
+  public Tuple3<String, Long, Integer> fold(Tuple3<String, Long, Integer> acc, SensorReading s) {
+      Integer cur = acc.getField(2);
+      acc.setField(cur + 1, 2);
+      return acc;
+  }
+}
+
+private static class MyProcessWindowFunction
+    extends ProcessWindowFunction<Tuple3<String, Long, Integer>, Tuple3<String, Long, Integer>, String, TimeWindow> {
+
+  public void process(String key,
+                    Context context,
+                    Iterable<Tuple3<String, Long, Integer>> counts,
+                    Collector<Tuple3<String, Long, Integer>> out) {
+    Integer count = counts.iterator().next().getField(2);
+    out.collect(new Tuple3<String, Long, Integer>(key, context.window().getEnd(),count));
+  }
+}
+复制代码
+```
+
+## Triggers
+
+Trigger用于决定窗口什么时候被window function处理。Flink中每个WindowAssigner都有一个默认的Trigger。我们也可以通过`trigger(...)`函数来自定义触发规则。
+
+Trigger接口包含以下5个方法：
+
+- The`onElement()`method is called for each element that is added to a window.
+- The`onEventTime()`method is called when a registered event-time timer fires.
+- The`onProcessingTime()`method is called when a registered processing-time timer fires.
+- The`onMerge()`method is relevant for stateful triggers and merges the states of two triggers when their corresponding windows merge,_e.g._when using session windows.
+- Finally the`clear()`method performs any action needed upon removal of the corresponding window.
+
+## Evictors
+
+Flink窗口模式允许我们指定一个WindowAssigner和Trigger之外的可选的Evictor。Evictor可以在触发器启动之后、窗口函数作用之前或之后移出窗口中的元素。
+
+```java
+/**
+ * Optionally evicts elements. Called before windowing function.
+ *
+ * @param elements The elements currently in the pane.
+ * @param size The current number of elements in the pane.
+ * @param window The {@link Window}
+ * @param evictorContext The context for the Evictor
+ */
+void evictBefore(Iterable<TimestampedValue<T>> elements, int size, W window, EvictorContext evictorContext);
+
+/**
+ * Optionally evicts elements. Called after windowing function.
+ *
+ * @param elements The elements currently in the pane.
+ * @param size The current number of elements in the pane.
+ * @param window The {@link Window}
+ * @param evictorContext The context for the Evictor
+ */
+void evictAfter(Iterable<TimestampedValue<T>> elements, int size, W window, EvictorContext evictorContext);
+复制代码
+```
+
+Flink为我们提供了三个预定义的evictors：
+
+- `CountEvictor`: 保留窗口中用户指定数量的元素，从窗口缓冲区开始部分删除其他元素。
+- `DeltaEvictor`: 获取一个DeltaFunction函数和阈值，计算窗口缓冲区中其余元素与最后一个元素的Delta值，然后将Delta值大于等于阈值的元素移除。
+- `TimeEvictor`: 持有一个毫秒级的`interval`参数，对于一个给定窗口，找到元素中的最大时间戳max_ts，然后删除那些时间戳小于max_ts - interval值的元素。
+
+**所有预定义的Evictor均会在窗口函数作用之前执行。**
+
+## Allowed Lateness
+
+当使用事件时间窗口时，可能会出现元素延迟到达的情况。例如，Flink用于跟踪单事件时间进程的watermark已经越过了元素所属窗口的结束时间。
+
+默认情况下，当watermark越过了窗口结束时间时，延迟到达的元素将会被丢弃。但是，Flink允许我们指定一个窗口的最大延迟时间，允许元素在被删除前（watermark到达结束时间时）可以延迟多长时间，它的默认值为0。根据所用触发器的不同，延迟到达但未废弃的元素可能会导致窗口的再次触发，使用`EventTimeTrigger`会有这种情况。
+
+```java
+DataStream<T> input = ...;
+
+input
+    .keyBy(<key selector>)
+    .window(<window assigner>)
+    .allowedLateness(<time>)
+    .<windowed transformation>(<window function>);
+```
+
+### Side Output
+
+Flink的side output可以让我们获得一个废弃元素的数据流。如下，通过设置窗口的`sideOutputLateData(OutputTag)`可以获取旁路输出流。
+
+```java
+final OutputTag<T> lateOutputTag = new OutputTag<T>("late-data"){};
+
+DataStream<T> input = ...;
+
+SingleOutputStreamOperator<T> result = input
+    .keyBy(<key selector>)
+    .window(<window assigner>)
+    .allowedLateness(<time>)
+    .sideOutputLateData(lateOutputTag)
+    .<windowed transformation>(<window function>);
+
+DataStream<T> lateStream = result.getSideOutput(lateOutputTag);
+```
